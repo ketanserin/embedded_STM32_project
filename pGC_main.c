@@ -486,17 +486,94 @@ void init_command(void){
 #define SAMPLE_INTERVAL_MS   100      // 루프 반복 주기
 #define REPORT_PERIOD_MS     1000     // 출력 주기
 #define AVG_WINDOW_SAMPLES   (REPORT_PERIOD_MS / SAMPLE_INTERVAL_MS)
+
+#define ZE08_FRAME_LEN                9U
+#define ZE08_QUERY_PERIOD_MS          1000U
+#define ZE08_SENSOR_TIMEOUT_MS        150U
+
+typedef struct
+{
+    uint16_t concentration_ppb;
+    uint16_t full_range_ppb;
+    uint8_t gas_id;
+    uint8_t unit;
+    uint8_t checksum;
+    uint32_t last_update_tick;
+    uint8_t valid;
+}ZE08_Data_t;
+
+static ZE08_Data_t g_ze08_data;
+static uint8_t g_ze08_rx_buf[ZE08_FRAME_LEN];
+
+static uint8_t ZE08_CalcChecksum(const uint8_t *frame)
+{
+    uint16_t sum = 0;
+    for (uint8_t i = 1; i < ZE08_FRAME_LEN - 1; i++) {
+        sum += frame[i];
+    }
+    return (uint8_t)(~sum + 1U);
+}
+
+static void ZE08_SendCommand(uint8_t cmd, uint8_t data)
+{
+    uint8_t tx[ZE08_FRAME_LEN] = {0xFF, 0x01, cmd, data, 0x00, 0x00, 0x00, 0x00, 0x00};
+    tx[8] = ZE08_CalcChecksum(tx);
+    HAL_UART_Transmit(&huart1, tx, ZE08_FRAME_LEN, 100);
+}
+
+static HAL_StatusTypeDef ZE08_ReadFrame(uint8_t *frame)
+{
+    return HAL_UART_Receive(&huart1, frame, ZE08_FRAME_LEN, ZE08_SENSOR_TIMEOUT_MS);
+}
+
+static uint8_t ZE08_ParseFrame(const uint8_t *frame, ZE08_Data_t *out)
+{
+    if ((frame[0] != 0xFFU) || (ZE08_CalcChecksum(frame) != frame[8])) {
+        return 0;
+    }
+
+    out->gas_id = frame[1];
+    out->unit = frame[2];
+    out->concentration_ppb = (uint16_t)(((uint16_t)frame[4] << 8) | frame[5]);
+    out->full_range_ppb = (uint16_t)(((uint16_t)frame[6] << 8) | frame[7]);
+    out->checksum = frame[8];
+    out->last_update_tick = HAL_GetTick();
+    out->valid = 1;
+
+    return 1;
+}
+
+static void ZE08_Init(void)
+{
+    memset(&g_ze08_data, 0, sizeof(g_ze08_data));
+    /* 0x78: 모드 전환, 0x40: 질의응답(QA) 모드 */
+    ZE08_SendCommand(0x78, 0x40);
+}
+
+static void ZE08_PollAndUpdate(void)
+{
+    ZE08_SendCommand(0x86, 0x00);
+    if ((ZE08_ReadFrame(g_ze08_rx_buf) == HAL_OK) && ZE08_ParseFrame(g_ze08_rx_buf, &g_ze08_data)) {
+        Fill5Ascii(PC_SEND_data.AD0, g_ze08_data.concentration_ppb);
+        Fill5Ascii(PC_SEND_data.AD1, g_ze08_data.full_range_ppb);
+    }
+}
 //#define TT
 void pGC_main(void)
 {
 	//initailze();														//Variable initialize
 	init_command();
 	ADS130B04_Init();
+	ZE08_Init();
 	/* Loop 			--------------------------------------------------*/
 	while(1){
 		g_sys_tick = 1;													//Delay start
 		while(g_sys_tick);
 		if(g_rcv_flagb){ ReadCheckCommand(); }
+
+		if ((HAL_GetTick() - g_ze08_data.last_update_tick) >= ZE08_QUERY_PERIOD_MS) {
+			ZE08_PollAndUpdate();
+		}
 
 		switch(g_sys_tick_count){
 			case 5 :
